@@ -6,7 +6,7 @@ import zipfile
 import json
 import base64
 import time
-from urllib.parse import quote_plus, parse_qs, urlsplit, urlencode, urlunsplit
+from urllib.parse import quote_plus, parse_qs, urlsplit
 from concurrent.futures import ThreadPoolExecutor
 
 import streamlit as st
@@ -87,32 +87,7 @@ def _profile_pic_variants(url: str) -> list[str]:
     clean = _clean_profile_pic_url(url)
     if not clean:
         return []
-
-    variants: list[str] = [clean]
-    split = urlsplit(clean)
-    query_map = parse_qs(split.query, keep_blank_values=True)
-    if "stp" in query_map:
-        query_without_stp = {k: v for k, v in query_map.items() if k != "stp"}
-        rebuilt = urlunsplit(
-            (
-                split.scheme,
-                split.netloc,
-                split.path,
-                urlencode(query_without_stp, doseq=True),
-                split.fragment,
-            )
-        )
-        if rebuilt and rebuilt != clean:
-            variants.append(rebuilt)
-
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for item in variants:
-        if item in seen:
-            continue
-        seen.add(item)
-        deduped.append(item)
-    return deduped
+    return [clean]
 
 
 def _append_profile_pic_candidate(candidates: list[str], url: str):
