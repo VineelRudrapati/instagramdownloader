@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import os
 import re
 import time
 from pathlib import Path
@@ -11,6 +12,7 @@ import requests
 
 # Public constants/functions consumed by ui.py
 IG_APP_ID = "936619743392459"
+IG_ASBD_ID = "129477"
 
 _DEFAULT_TIMEOUT = 20
 _MAX_PAGE_SIZE = 50
@@ -28,6 +30,16 @@ _VALID_EXTENSIONS = {
     ".m4v",
 }
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
+_AUTH_ENV_COOKIE_MAP = {
+    "IG_SESSIONID": "sessionid",
+    "IG_CSRFTOKEN": "csrftoken",
+    "IG_DS_USER_ID": "ds_user_id",
+    "IG_RUR": "rur",
+    "IG_MID": "mid",
+    "IG_IG_DID": "ig_did",
+    "IG_SHBID": "shbid",
+    "IG_SHBTS": "shbts",
+}
 
 
 def _new_session() -> requests.Session:
@@ -42,12 +54,76 @@ def _new_session() -> requests.Session:
             "Accept": "*/*",
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://www.instagram.com/",
+            "Origin": "https://www.instagram.com",
             "X-IG-App-ID": IG_APP_ID,
+            "X-ASBD-ID": IG_ASBD_ID,
             "X-Requested-With": "XMLHttpRequest",
             "Connection": "keep-alive",
         }
     )
+
+    for env_key, cookie_name in _AUTH_ENV_COOKIE_MAP.items():
+        value = str(os.getenv(env_key, "")).strip()
+        if not value:
+            continue
+        session.cookies.set(cookie_name, value, domain=".instagram.com", path="/")
+
+    csrf_token = str(session.cookies.get("csrftoken") or "").strip()
+    if csrf_token:
+        session.headers["X-CSRFToken"] = csrf_token
+
     return session
+
+
+def _extract_lsd_token(page_html: str) -> str:
+    if not page_html:
+        return ""
+    patterns = (
+        r'"LSD",\[\],\{"token":"([^"]+)"\}',
+        r'"lsd":"([^"]+)"',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, page_html)
+        if match:
+            token = str(match.group(1) or "").strip()
+            if token:
+                return token
+    return ""
+
+
+def _prime_instagram_session(session: requests.Session, username: str = "") -> str:
+    normalized = _normalize_username(username)
+    targets = ["https://www.instagram.com/"]
+    if normalized:
+        targets.append(f"https://www.instagram.com/{normalized}/")
+
+    lsd_token = ""
+    for target in targets:
+        try:
+            response = session.get(
+                target,
+                timeout=14,
+                allow_redirects=True,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Referer": "https://www.instagram.com/",
+                },
+            )
+            if response.status_code >= 400:
+                continue
+            token = _extract_lsd_token(response.text)
+            if token:
+                lsd_token = token
+        except Exception:
+            continue
+
+    csrf_token = str(session.cookies.get("csrftoken") or "").strip()
+    if csrf_token:
+        session.headers["X-CSRFToken"] = csrf_token
+    if lsd_token:
+        session.headers["X-FB-LSD"] = lsd_token
+    return lsd_token
 
 
 def _guess_extension(url: str, is_video: bool) -> str:
@@ -273,6 +349,7 @@ def get_recent_posts_detailed(username: str, post_limit: int = 100) -> tuple[int
 
     post_limit = max(1, int(post_limit))
     session = _new_session()
+    _prime_instagram_session(session, normalized)
     profile_count: int | None = None
 
     posts: list[dict[str, Any]] = []

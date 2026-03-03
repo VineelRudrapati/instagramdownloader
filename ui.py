@@ -5,19 +5,25 @@ import io
 import zipfile
 import json
 import base64
-from urllib.parse import quote_plus, parse_qs, urlsplit
+import time
+from urllib.parse import quote_plus, parse_qs, urlsplit, urlencode, urlunsplit
 from concurrent.futures import ThreadPoolExecutor
 
 import streamlit as st
 import requests
 
-from scrap import _guess_extension, _new_session, get_recent_posts_detailed
+from scrap import _guess_extension, _new_session, _prime_instagram_session, get_recent_posts_detailed
 
 POST_FETCH_LIMIT = 60
 POST_FETCH_OPTIONS = [60, 120, 240, 500]
 ITEMS_PER_PAGE = 50
 PROFILE_PAGE_CONTENT_QUERY_ID = "33954869174158742"
 PROFILE_POSTS_QUERY_ID = "26149520921371801"
+_GENERIC_PROFILE_PIC_MARKERS = (
+    "44884218_345707102882519_2446069589734326272_n",
+    "/default_profile_",
+    "/default_avatar/",
+)
 
 
 def _normalize_username(username: str) -> str:
@@ -57,6 +63,63 @@ def _extract_profile_user_id(page_html: str) -> str:
     return m.group(1) if m else ""
 
 
+def _extract_lsd_token(page_html: str) -> str:
+    if not page_html:
+        return ""
+    patterns = (
+        r'"LSD",\[\],\{"token":"([^"]+)"\}',
+        r'"lsd":"([^"]+)"',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, page_html)
+        if match:
+            token = str(match.group(1) or "").strip()
+            if token:
+                return token
+    return ""
+
+
+def _clean_profile_pic_url(raw_url: str) -> str:
+    return html.unescape(str(raw_url or "").strip()).replace("\\u0026", "&").replace("\\/", "/")
+
+
+def _profile_pic_variants(url: str) -> list[str]:
+    clean = _clean_profile_pic_url(url)
+    if not clean:
+        return []
+
+    variants: list[str] = [clean]
+    split = urlsplit(clean)
+    query_map = parse_qs(split.query, keep_blank_values=True)
+    if "stp" in query_map:
+        query_without_stp = {k: v for k, v in query_map.items() if k != "stp"}
+        rebuilt = urlunsplit(
+            (
+                split.scheme,
+                split.netloc,
+                split.path,
+                urlencode(query_without_stp, doseq=True),
+                split.fragment,
+            )
+        )
+        if rebuilt and rebuilt != clean:
+            variants.append(rebuilt)
+
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for item in variants:
+        if item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def _append_profile_pic_candidate(candidates: list[str], url: str):
+    for candidate in _profile_pic_variants(url):
+        candidates.append(candidate)
+
+
 def _profile_pic_candidates_from_user(user: dict) -> list[str]:
     if not isinstance(user, dict):
         return []
@@ -64,9 +127,7 @@ def _profile_pic_candidates_from_user(user: dict) -> list[str]:
     candidates: list[str] = []
     hd_info = user.get("hd_profile_pic_url_info")
     if isinstance(hd_info, dict):
-        url = str(hd_info.get("url") or "").strip()
-        if url:
-            candidates.append(url)
+        _append_profile_pic_candidate(candidates, str(hd_info.get("url") or ""))
 
     hd_versions = user.get("hd_profile_pic_versions")
     if isinstance(hd_versions, list):
@@ -82,21 +143,44 @@ def _profile_pic_candidates_from_user(user: dict) -> list[str]:
             ranked.append((width * height, url))
         ranked.sort(key=lambda item: item[0], reverse=True)
         for _, url in ranked:
-            candidates.append(url)
+            _append_profile_pic_candidate(candidates, url)
 
     profile_hd_url = str(user.get("profile_pic_url_hd") or "").strip()
     if profile_hd_url:
-        candidates.append(profile_hd_url)
+        _append_profile_pic_candidate(candidates, profile_hd_url)
 
     profile_url_info = user.get("profile_pic_url_info")
     if isinstance(profile_url_info, dict):
-        url = str(profile_url_info.get("url") or "").strip()
-        if url:
-            candidates.append(url)
+        _append_profile_pic_candidate(candidates, str(profile_url_info.get("url") or ""))
 
     profile_url = str(user.get("profile_pic_url") or "").strip()
     if profile_url:
-        candidates.append(profile_url)
+        _append_profile_pic_candidate(candidates, profile_url)
+
+    return candidates
+
+
+def _profile_pic_candidates_from_page_html(page_html: str) -> list[str]:
+    if not page_html:
+        return []
+
+    candidates: list[str] = []
+    m = re.search(
+        r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"',
+        page_html,
+        re.I,
+    )
+    if m:
+        _append_profile_pic_candidate(candidates, m.group(1))
+
+    normalized = html.unescape(page_html).replace("\\/", "/").replace("\\u0026", "&")
+    for pattern in (
+        r'"profile_pic_url_hd"\s*:\s*"([^"]+)"',
+        r'"profile_pic_url"\s*:\s*"([^"]+)"',
+        r'"hd_profile_pic_url_info"\s*:\s*\{[^{}]*"url"\s*:\s*"([^"]+)"',
+    ):
+        for match in re.finditer(pattern, normalized):
+            _append_profile_pic_candidate(candidates, match.group(1))
 
     return candidates
 
@@ -160,6 +244,11 @@ def _profile_pic_score(url: str) -> int:
         return -10_000
 
     score = _profile_pic_quality_hint(url) * 10
+    lowered = url.lower()
+    if any(marker in lowered for marker in _GENERIC_PROFILE_PIC_MARKERS):
+        score -= 5_000
+    if "static.cdninstagram.com/rsrc.php" in lowered:
+        score -= 7_000
     if "profile_pic" in url:
         score += 500
     if re.search(r"s150x150", url):
@@ -198,6 +287,12 @@ def _merge_profile_from_user(profile: dict, user: dict, pic_candidates: list[str
 
     if not profile.get("user_id"):
         profile["user_id"] = str(user.get("pk") or user.get("id") or "").strip()
+
+    if profile.get("is_private") is None and user.get("is_private") is not None:
+        try:
+            profile["is_private"] = bool(user.get("is_private"))
+        except Exception:
+            pass
 
     if profile.get("followers") is None:
         followers = user.get("follower_count")
@@ -309,6 +404,51 @@ def _graphql_first_post_user(session: requests.Session, username: str) -> dict:
                 return user
     except Exception:
         pass
+    return {}
+
+
+def _web_profile_info_user(session: requests.Session, username: str, lsd_token: str = "") -> dict:
+    normalized = _normalize_username(username)
+    if not normalized:
+        return {}
+
+    endpoints = (
+        "https://www.instagram.com/api/v1/users/web_profile_info/",
+        "https://i.instagram.com/api/v1/users/web_profile_info/",
+    )
+    referer = f"https://www.instagram.com/{normalized}/"
+
+    for endpoint in endpoints:
+        for attempt in range(2):
+            try:
+                headers = {
+                    "Referer": referer,
+                    "Accept": "*/*",
+                    "X-ASBD-ID": "129477",
+                }
+                if lsd_token:
+                    headers["X-FB-LSD"] = lsd_token
+
+                r = session.get(
+                    endpoint,
+                    params={"username": normalized},
+                    headers=headers,
+                    timeout=14,
+                    allow_redirects=True,
+                )
+                if r.status_code == 429:
+                    time.sleep(0.9 * (attempt + 1))
+                    continue
+                r.raise_for_status()
+
+                payload = r.json()
+                data = payload.get("data") if isinstance(payload, dict) else {}
+                user = data.get("user") if isinstance(data, dict) else {}
+                if isinstance(user, dict) and user:
+                    return user
+            except Exception:
+                continue
+
     return {}
 
 
@@ -426,6 +566,11 @@ def _ensure_session_state():
             st.session_state[key] = value
 
 
+def _has_instagram_auth_session() -> bool:
+    session = _new_session()
+    return bool(str(session.cookies.get("sessionid") or "").strip())
+
+
 @st.cache_data(show_spinner=False, ttl=900)
 def _cached_recent_posts(username: str, post_limit: int) -> tuple[int | None, list[dict]]:
     return get_recent_posts_detailed(username, post_limit=post_limit)
@@ -468,9 +613,15 @@ def _load_profile_media(username: str):
                 )
                 if not has_profile_signal:
                     raise posts_error
-                st.session_state["load_notice"] = (
+                load_notice = (
                     "Profile media is not publicly accessible. Showing available profile details and best-available DP."
                 )
+                if bool(profile_info.get("is_private")) and not _has_instagram_auth_session():
+                    load_notice += (
+                        " To improve private-account DP accuracy on hosted Streamlit, set secrets/env vars "
+                        "`IG_SESSIONID` and `IG_CSRFTOKEN` from a logged-in Instagram session."
+                    )
+                st.session_state["load_notice"] = load_notice
             else:
                 st.session_state["load_notice"] = ""
 
@@ -526,16 +677,23 @@ def _profile_overview(username: str) -> dict:
         "profile_pic_url": "",
         "followers": None,
         "posts": None,
+        "is_private": None,
     }
 
     session = _new_session()
+    lsd_token = _prime_instagram_session(session, normalized)
     pic_candidates: list[str] = []
+
+    web_user = _web_profile_info_user(session, normalized, lsd_token=lsd_token)
+    _merge_profile_from_user(profile, web_user, pic_candidates)
 
     try:
         r = session.get(
             f"https://www.instagram.com/api/v1/feed/user/{normalized}/username/",
             params={"count": 1},
             timeout=18,
+            allow_redirects=True,
+            headers={"Referer": f"https://www.instagram.com/{normalized}/"},
         )
         r.raise_for_status()
         payload = r.json()
@@ -572,17 +730,13 @@ def _profile_overview(username: str) -> dict:
         )
         r.raise_for_status()
         page_html = r.text
+        if not lsd_token:
+            lsd_token = _extract_lsd_token(page_html)
         html_user_id = _extract_profile_user_id(page_html)
         if html_user_id and not profile["user_id"]:
             profile["user_id"] = html_user_id
 
-        m = re.search(
-            r'<meta[^>]+property="og:image"[^>]+content="([^"]+)"',
-            page_html,
-            re.I,
-        )
-        if m:
-            pic_candidates.append(html.unescape(m.group(1)))
+        pic_candidates.extend(_profile_pic_candidates_from_page_html(page_html))
 
         d = re.search(
             r'<meta[^>]+property="og:description"[^>]+content="([^"]+)"',
@@ -601,6 +755,9 @@ def _profile_overview(username: str) -> dict:
                     profile["posts"] = _parse_count(posts_match.group(1))
     except Exception:
         pass
+
+    web_user = _web_profile_info_user(session, normalized, lsd_token=lsd_token)
+    _merge_profile_from_user(profile, web_user, pic_candidates)
 
     user_id = str(profile.get("user_id") or "").strip()
     if user_id:
