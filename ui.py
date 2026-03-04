@@ -848,6 +848,8 @@ def _render_zip_download_block(state_key: str, label: str):
 
 def _render_media_tab(tab_key: str, username: str, items: list[dict]):
     page_state_key = f"page_{tab_key}"
+    jump_input_key = f"{tab_key}_jump_page_input"
+    jump_sync_key = f"{tab_key}_jump_page_sync"
 
     if not items:
         st.info("No media available in this tab for the current username.")
@@ -859,19 +861,45 @@ def _render_media_tab(tab_key: str, username: str, items: list[dict]):
     current_page = max(1, min(current_page, total_pages))
     st.session_state[page_state_key] = current_page
 
-    nav1, nav2, nav3, nav4 = st.columns([1, 1, 2, 3])
+    if jump_input_key not in st.session_state:
+        st.session_state[jump_input_key] = current_page
+        st.session_state[jump_sync_key] = current_page
+    elif int(st.session_state.get(jump_sync_key, current_page)) != current_page:
+        st.session_state[jump_input_key] = current_page
+        st.session_state[jump_sync_key] = current_page
+
+    nav1, nav2, nav3, nav4, nav5, nav6 = st.columns([1, 1, 2, 2, 1.4, 1])
     with nav1:
         if st.button("Previous", key=f"{tab_key}_prev", disabled=current_page <= 1):
             st.session_state[page_state_key] = current_page - 1
+            st.session_state[jump_sync_key] = current_page - 1
             st.rerun()
     with nav2:
         if st.button("Next", key=f"{tab_key}_next", disabled=current_page >= total_pages):
             st.session_state[page_state_key] = current_page + 1
+            st.session_state[jump_sync_key] = current_page + 1
             st.rerun()
     with nav3:
         st.write(f"Page `{current_page}` / `{total_pages}`")
     with nav4:
         st.write(f"Items: `{total_items}` | `50` per page")
+    with nav5:
+        st.number_input(
+            "Go to page",
+            min_value=1,
+            max_value=total_pages,
+            step=1,
+            key=jump_input_key,
+        )
+    with nav6:
+        st.write("")
+        if st.button("Go", key=f"{tab_key}_go_to_page"):
+            target_page = int(st.session_state.get(jump_input_key, current_page))
+            target_page = max(1, min(target_page, total_pages))
+            if target_page != current_page:
+                st.session_state[page_state_key] = target_page
+                st.session_state[jump_sync_key] = target_page
+                st.rerun()
 
     start = (current_page - 1) * ITEMS_PER_PAGE
     end = start + ITEMS_PER_PAGE
