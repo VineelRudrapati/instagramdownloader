@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import os
 import re
 import time
@@ -17,6 +18,7 @@ IG_ASBD_ID = "129477"
 _DEFAULT_TIMEOUT = 20
 _MAX_PAGE_SIZE = 50
 _TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
+_POST_ROOT_QUERY_DOC_ID = "25874459848900880"
 _VALID_EXTENSIONS = {
     ".jpg",
     ".jpeg",
@@ -30,6 +32,7 @@ _VALID_EXTENSIONS = {
     ".m4v",
 }
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,30}$")
+_SHORTCODE_RE = re.compile(r"^[A-Za-z0-9_-]{5,30}$")
 _AUTH_ENV_COOKIE_MAP = {
     "IG_SESSIONID": "sessionid",
     "IG_CSRFTOKEN": "csrftoken",
@@ -138,6 +141,38 @@ def _guess_extension(url: str, is_video: bool) -> str:
 def _normalize_username(username: str) -> str:
     normalized = re.sub(r"\s+", "", (username or "")).lstrip("@").strip()
     return normalized
+
+
+def _extract_shortcode(post_url: str) -> str:
+    raw = str(post_url or "").strip()
+    if not raw:
+        return ""
+
+    if _SHORTCODE_RE.fullmatch(raw):
+        return raw
+
+    if not re.match(r"^https?://", raw, flags=re.I):
+        raw = f"https://{raw.lstrip('/')}"
+
+    parsed = urlparse(raw)
+    host = str(parsed.netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if not host.endswith("instagram.com"):
+        return ""
+
+    parts = [segment for segment in parsed.path.split("/") if segment]
+    if len(parts) >= 2 and parts[0] in {"p", "reel", "tv"}:
+        shortcode = parts[1]
+    elif len(parts) >= 3 and parts[0] == "share" and parts[1] in {"p", "reel", "tv"}:
+        shortcode = parts[2]
+    else:
+        return ""
+
+    shortcode = shortcode.strip()
+    if _SHORTCODE_RE.fullmatch(shortcode):
+        return shortcode
+    return ""
 
 
 def _parse_compact_count(raw: str) -> int | None:
@@ -338,6 +373,52 @@ def _to_post_dict(item: dict[str, Any]) -> dict[str, Any]:
             )
 
     return {"post_id": post_id, "post_type": post_type, "media_items": media_items}
+
+
+def get_post_from_url_detailed(post_url: str) -> dict[str, Any]:
+    shortcode = _extract_shortcode(post_url)
+    if not shortcode:
+        raise ValueError("Enter a valid Instagram post/reel URL (or shortcode).")
+
+    session = _new_session()
+    _prime_instagram_session(session)
+
+    payload = _request_json(
+        session,
+        "https://www.instagram.com/graphql/query/",
+        params={
+            "doc_id": _POST_ROOT_QUERY_DOC_ID,
+            "variables": json.dumps({"shortcode": shortcode}, separators=(",", ":")),
+        },
+    )
+
+    data = payload.get("data") if isinstance(payload, dict) else {}
+    media_root = data.get("xdt_api__v1__media__shortcode__web_info") if isinstance(data, dict) else {}
+    items = media_root.get("items") if isinstance(media_root, dict) else []
+    if not isinstance(items, list) or not items:
+        errors = payload.get("errors") if isinstance(payload, dict) else None
+        if errors:
+            raise RuntimeError(
+                "Instagram did not return media details for this URL. "
+                "The post may be private, unavailable, or temporarily blocked."
+            )
+        raise RuntimeError("Could not resolve media details for this Instagram URL.")
+
+    media_item = items[0] if isinstance(items[0], dict) else {}
+    post = _to_post_dict(media_item)
+    if not post["media_items"]:
+        raise RuntimeError("No downloadable media found for this Instagram URL.")
+
+    owner = media_item.get("user") if isinstance(media_item, dict) else {}
+    owner_username = ""
+    if isinstance(owner, dict):
+        owner_username = _normalize_username(str(owner.get("username") or ""))
+
+    return {
+        "shortcode": shortcode,
+        "owner_username": owner_username,
+        "post": post,
+    }
 
 
 def get_recent_posts_detailed(username: str, post_limit: int = 100) -> tuple[int | None, list[dict[str, Any]]]:

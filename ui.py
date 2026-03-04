@@ -12,7 +12,13 @@ from concurrent.futures import ThreadPoolExecutor
 import streamlit as st
 import requests
 
-from scrap import _guess_extension, _new_session, _prime_instagram_session, get_recent_posts_detailed
+from scrap import (
+    _guess_extension,
+    _new_session,
+    _prime_instagram_session,
+    get_post_from_url_detailed,
+    get_recent_posts_detailed,
+)
 
 POST_FETCH_LIMIT = 60
 POST_FETCH_OPTIONS = [60, 120, 240, 500]
@@ -529,6 +535,8 @@ def _ensure_session_state():
         "post_items": [],
         "load_error": "",
         "load_notice": "",
+        "url_load_error": "",
+        "url_media_result": {},
         "post_fetch_limit": POST_FETCH_LIMIT,
         "page_all": 1,
         "page_reels": 1,
@@ -549,6 +557,27 @@ def _has_instagram_auth_session() -> bool:
 @st.cache_data(show_spinner=False, ttl=900)
 def _cached_recent_posts(username: str, post_limit: int) -> tuple[int | None, list[dict]]:
     return get_recent_posts_detailed(username, post_limit=post_limit)
+
+
+@st.cache_data(show_spinner=False, ttl=900)
+def _cached_post_from_url(post_url: str) -> dict:
+    return get_post_from_url_detailed(post_url)
+
+
+def _load_media_from_url(post_url: str):
+    cleaned = str(post_url or "").strip()
+    st.session_state["url_media_result"] = {}
+    st.session_state["url_load_error"] = ""
+
+    if not cleaned:
+        st.warning("Enter a valid Instagram post/reel URL.")
+        return
+
+    with st.spinner("Loading media from URL..."):
+        try:
+            st.session_state["url_media_result"] = _cached_post_from_url(cleaned)
+        except Exception as e:
+            st.session_state["url_load_error"] = str(e)
 
 
 def _load_profile_media(username: str):
@@ -900,11 +929,53 @@ def _render_media_tab(tab_key: str, username: str, items: list[dict]):
             )
 
 
+def _render_post_url_downloader():
+    st.subheader("Download By Post URL")
+    st.caption("Paste a post/reel URL and download the highest-quality media available.")
+
+    with st.form("url_form"):
+        post_url_input = st.text_input(
+            "Instagram Post/Reel URL",
+            placeholder="https://www.instagram.com/p/XXXXXXXXXXX/",
+        )
+        url_submitted = st.form_submit_button("Load URL Media")
+
+    if url_submitted:
+        _load_media_from_url(post_url_input)
+
+    if st.session_state.get("url_load_error"):
+        st.error(str(st.session_state["url_load_error"]))
+        return
+
+    media_result = st.session_state.get("url_media_result")
+    if not isinstance(media_result, dict) or not media_result:
+        st.info("No URL media loaded yet.")
+        return
+
+    post = media_result.get("post")
+    if not isinstance(post, dict):
+        st.error("Invalid media response from Instagram.")
+        return
+
+    owner_username = _normalize_username(str(media_result.get("owner_username") or ""))
+    shortcode = _safe_token(str(media_result.get("shortcode") or post.get("post_id") or "post"))
+    display_owner = owner_username or "instagram"
+
+    post_items = _flatten_posts([post])
+    st.caption(
+        f"Loaded shortcode `{shortcode}`"
+        + (f" from `@{owner_username}`." if owner_username else ".")
+    )
+    _render_media_tab(f"url_{shortcode}", display_owner, post_items)
+
+
 st.set_page_config(page_title="Instagram Media Downloader", layout="wide")
 _ensure_session_state()
 
 st.title("Instagram Media Downloader")
 st.caption("Enter a username. Pagination is fixed at 50 items per page.")
+_render_post_url_downloader()
+st.divider()
 st.sidebar.subheader("Settings")
 selected_limit = st.sidebar.selectbox(
     "Max posts to fetch per load",
