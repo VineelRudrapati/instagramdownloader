@@ -6,6 +6,7 @@ import zipfile
 import json
 import base64
 import time
+import hashlib
 from urllib.parse import quote_plus, parse_qs, urlsplit
 from concurrent.futures import ThreadPoolExecutor
 
@@ -472,6 +473,79 @@ def _build_filename(username: str, item: dict) -> str:
     return f"{username}_{group}_{post_id}_{media_idx}{ext}"
 
 
+def _media_item_selection_key(item: dict) -> str:
+    post_id = str(item.get("post_id") or "")
+    media_idx = int(item.get("media_idx") or 1)
+    media_url = str(item.get("url") or "").strip()
+    is_video = 1 if bool(item.get("is_video")) else 0
+    return f"{post_id}|{media_idx}|{is_video}|{media_url}"
+
+
+def _media_checkbox_widget_key(username: str, item: dict, tab_scope: str = "all") -> str:
+    digest = hashlib.sha1(_media_item_selection_key(item).encode("utf-8")).hexdigest()[:16]
+    return f"select_{_safe_token(username)}_{_safe_token(tab_scope)}_{digest}"
+
+
+def _selected_media_keys_for_user(username: str) -> set[str]:
+    normalized = _normalize_username(username)
+    store = st.session_state.get("selected_media_keys_by_user", {})
+    if not isinstance(store, dict):
+        return set()
+    values = store.get(normalized, [])
+    if not isinstance(values, list):
+        return set()
+    return {str(value) for value in values if str(value).strip()}
+
+
+def _set_selected_media_keys_for_user(username: str, keys: set[str]):
+    normalized = _normalize_username(username)
+    store = st.session_state.get("selected_media_keys_by_user", {})
+    if not isinstance(store, dict):
+        store = {}
+    updated = dict(store)
+    if keys:
+        updated[normalized] = sorted(keys)
+    elif normalized in updated:
+        del updated[normalized]
+    st.session_state["selected_media_keys_by_user"] = updated
+
+
+def _selected_media_items_for_user(username: str, items: list[dict]) -> list[dict]:
+    selected_keys = _selected_media_keys_for_user(username)
+    if not selected_keys:
+        return []
+
+    selected_items: list[dict] = []
+    available_keys: set[str] = set()
+    seen: set[str] = set()
+    for item in items:
+        key = _media_item_selection_key(item)
+        available_keys.add(key)
+        if key in selected_keys and key not in seen:
+            selected_items.append(item)
+            seen.add(key)
+
+    if selected_keys - available_keys:
+        _set_selected_media_keys_for_user(username, selected_keys & available_keys)
+    return selected_items
+
+
+def _clear_selected_media_for_user(username: str, items: list[dict]):
+    _set_selected_media_keys_for_user(username, set())
+    key_prefix = f"select_{_safe_token(username)}_"
+    for key in list(st.session_state.keys()):
+        if isinstance(key, str) and key.startswith(key_prefix):
+            del st.session_state[key]
+
+
+def _prune_selected_media_for_user(username: str, items: list[dict]):
+    selected_keys = _selected_media_keys_for_user(username)
+    if not selected_keys:
+        return
+    available_keys = {_media_item_selection_key(item) for item in items}
+    _set_selected_media_keys_for_user(username, selected_keys & available_keys)
+
+
 def _fetch_media_bytes(session: requests.Session, media_url: str) -> bytes:
     chunks: list[bytes] = []
     total = 0
@@ -543,6 +617,7 @@ def _ensure_session_state():
         "page_videos": 1,
         "page_photos": 1,
         "favorites": [],
+        "selected_media_keys_by_user": {},
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -632,7 +707,9 @@ def _load_profile_media(username: str):
             st.session_state["loaded_username"] = normalized
             st.session_state["profile_count"] = profile_count
             st.session_state["profile_info"] = profile_info
-            st.session_state["post_items"] = _flatten_posts(posts)
+            flattened_items = _flatten_posts(posts)
+            st.session_state["post_items"] = flattened_items
+            _prune_selected_media_for_user(normalized, flattened_items)
             st.session_state["load_error"] = ""
         except Exception as e:
             _reset_loaded_state()
@@ -846,7 +923,7 @@ def _render_zip_download_block(state_key: str, label: str):
             st.text(f"... and {len(errors) - 6} more errors")
 
 
-def _render_media_tab(tab_key: str, username: str, items: list[dict]):
+def _render_media_tab(tab_key: str, username: str, items: list[dict], enable_selection: bool = False):
     page_state_key = f"page_{tab_key}"
     jump_input_key = f"{tab_key}_jump_page_input"
     jump_sync_key = f"{tab_key}_jump_page_sync"
@@ -904,6 +981,8 @@ def _render_media_tab(tab_key: str, username: str, items: list[dict]):
     start = (current_page - 1) * ITEMS_PER_PAGE
     end = start + ITEMS_PER_PAGE
     page_items = items[start:end]
+    selected_keys = _selected_media_keys_for_user(username) if enable_selection else set()
+    selection_changed = False
 
     page_bundle_key = _bundle_state_key(username, tab_key, "page", current_page)
     all_bundle_key = _bundle_state_key(username, tab_key, "all")
@@ -935,6 +1014,31 @@ def _render_media_tab(tab_key: str, username: str, items: list[dict]):
     grid = st.columns(3)
     for idx, item in enumerate(page_items):
         with grid[idx % 3]:
+            if enable_selection:
+                media_key = _media_item_selection_key(item)
+                checkbox_key = _media_checkbox_widget_key(username, item, tab_scope=tab_key)
+                sync_key = f"{checkbox_key}__sync"
+                selected_value = media_key in selected_keys
+
+                if checkbox_key not in st.session_state:
+                    st.session_state[checkbox_key] = selected_value
+                    st.session_state[sync_key] = selected_value
+                else:
+                    last_sync = bool(st.session_state.get(sync_key, st.session_state[checkbox_key]))
+                    current_value = bool(st.session_state[checkbox_key])
+                    user_toggled = current_value != last_sync
+                    if (not user_toggled) and (current_value != selected_value):
+                        st.session_state[checkbox_key] = selected_value
+
+                checked = st.checkbox("Select", key=checkbox_key)
+                if checked and media_key not in selected_keys:
+                    selected_keys.add(media_key)
+                    selection_changed = True
+                elif not checked and media_key in selected_keys:
+                    selected_keys.remove(media_key)
+                    selection_changed = True
+                st.session_state[sync_key] = bool(checked)
+
             media_kind = "Video" if item["is_video"] else "Photo"
             caption = f"{item['post_id']} - {media_kind}"
             try:
@@ -955,6 +1059,54 @@ def _render_media_tab(tab_key: str, username: str, items: list[dict]):
                 f'<a href="{item["url"]}" download="{filename}" target="_blank" rel="noopener noreferrer">Download This Item</a>',
                 unsafe_allow_html=True,
             )
+
+    if enable_selection and selection_changed:
+        _set_selected_media_keys_for_user(username, selected_keys)
+
+
+def _render_selected_media_download(username: str, all_items: list[dict]):
+    st.subheader("Selected Media")
+    st.caption(
+        "Select items in `All Posts`, `Reels`, or `Videos` across pages. Download only selected items in one ZIP."
+    )
+
+    selected_items = _selected_media_items_for_user(username, all_items)
+    selected_count = len(selected_items)
+    bundle_key = _bundle_state_key(username, "selected", "all")
+
+    info_col, action_col1, action_col2 = st.columns([1.4, 1.2, 3])
+    with info_col:
+        st.metric("Selected Items", f"{selected_count:,}")
+    with action_col1:
+        st.write("")
+        if st.button(
+            "Clear Selection",
+            key=f"clear_selection_{_safe_token(username)}",
+            disabled=selected_count <= 0,
+        ):
+            _clear_selected_media_for_user(username, all_items)
+            st.session_state.pop(bundle_key, None)
+            st.rerun()
+    with action_col2:
+        st.write("")
+        if st.button(
+            "Prepare Selected ZIP",
+            key=f"prepare_selected_zip_{_safe_token(username)}",
+            disabled=selected_count <= 0,
+        ):
+            with st.spinner("Preparing selected media ZIP..."):
+                zip_bytes, errors = _build_zip_bytes(username, selected_items)
+            st.session_state[bundle_key] = {
+                "data": zip_bytes,
+                "filename": f"{username}_selected_media.zip",
+                "errors": errors,
+            }
+
+    if selected_count <= 0:
+        st.info("No media selected yet. Use checkboxes in `All Posts`, `Reels`, or `Videos` tabs.")
+        return
+
+    _render_zip_download_block(bundle_key, "Save Selected ZIP")
 
 
 def _render_post_url_downloader():
@@ -1069,6 +1221,7 @@ st.write(
     f"Reels: `{len(reel_items)}` | Videos: `{len(video_items)}` | Photos: `{len(photo_items)}`"
 )
 st.caption("Use the download controls below to save media directly from your browser.")
+_render_selected_media_download(active_username, all_items)
 
 if active_username in st.session_state.get("favorites", []):
     st.caption(f"`@{active_username}` is already in favorites.")
@@ -1080,13 +1233,13 @@ else:
 tab_all, tab_reels, tab_videos, tab_photos = st.tabs(["All Posts", "Reels", "Videos", "Photos"])
 
 with tab_all:
-    _render_media_tab("all", active_username, all_items)
+    _render_media_tab("all", active_username, all_items, enable_selection=True)
 
 with tab_reels:
-    _render_media_tab("reels", active_username, reel_items)
+    _render_media_tab("reels", active_username, reel_items, enable_selection=True)
 
 with tab_videos:
-    _render_media_tab("videos", active_username, video_items)
+    _render_media_tab("videos", active_username, video_items, enable_selection=True)
 
 with tab_photos:
     _render_media_tab("photos", active_username, photo_items)
