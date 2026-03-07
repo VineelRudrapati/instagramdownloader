@@ -1,12 +1,4 @@
 # Performance Optimizations in ui.py
-
-## Optimizations Made:
-1. **Lazy Loading of Favorites Profile Pictures**: Profile pictures are now loaded only when they come into the viewport, reducing initial load time.
-2. **Reduced Regex Operations**: Optimized regular expressions to minimize the number of operations and improve matching speed.
-3. **Optimized DOM Rendering**: Implemented lazy loading for thumbnail images to ensure only visible images are rendered, enhancing performance.
-4. **Caching Improvements**: Introduced caching for frequently accessed data to minimize redundant processing and API calls.
-5. **Parallel Thumbnail Loading**: Thumbnails now load in parallel, speeding up the overall loading process when running the application on localhost.
-
 # Code Changes
 
 ```python
