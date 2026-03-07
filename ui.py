@@ -1,9 +1,3 @@
-# Performance Optimizations in ui.py
-# Code Changes
-
-```python
-# Assume existing imports
-
 # Lazy loading function
 def lazy_load_images(images):
     for img in images:
